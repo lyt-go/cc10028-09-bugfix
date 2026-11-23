@@ -126,6 +126,31 @@ class BaseModuleService:
                 written += 1
         return written
 
+    def _write_jsonl_keyed(
+        self,
+        filepath: Path,
+        records: list[dict[str, Any]],
+        key_field: str,
+        key_value: Any,
+    ) -> int:
+        """按业务键幂等写入JSONL：先移除同键旧记录，再追加新记录，返回新写入条数。
+
+        续做场景下同一个续做凭据可能被重复受理，用业务键替换而不是追加，
+        保证同一凭据只落盘一份明细，同时保留文件里其他来源的记录。
+        """
+        _ensure_dir(filepath.parent)
+        retained: list[dict[str, Any]] = []
+        if filepath.exists():
+            retained = [
+                rec for rec in self._read_jsonl(filepath)
+                if rec.get(key_field) != key_value
+            ]
+        merged = retained + records
+        with open(filepath, "w", encoding="utf-8") as f:
+            for rec in merged:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        return len(records)
+
     def _read_jsonl(self, filepath: Path) -> list[dict[str, Any]]:
         """从JSONL文件读取全部记录，文件不存在返回空列表，脏行自动跳过。"""
         if not filepath.exists():

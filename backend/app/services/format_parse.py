@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 import re
+from pathlib import Path
 from typing import Any
 
 from app.services.base import BaseModuleService, _ensure_dir
@@ -160,6 +161,100 @@ class FormatParseService(BaseModuleService):
             task["status"] = "解析失败"
             task["abnormal"] = True
             return {"task_id": task_id, "error": str(e), "doc_id": doc_id}
+
+    def resume_from_retry(self, retry_id: str, batch_key: str | None = None) -> dict[str, Any]:
+        """消费重采终态确认中获准续做的范围，落盘续做凭据对应的解析页明细。
+
+        只有「已完成」的终态确认才带续做凭据；重复受理同一重采编号时
+        按页幂等覆盖明细，不新建解析任务记录，也不重复追加解析页。
+        """
+        try:
+            retry_cls = self._safe_import("app.services.parse_retry", "ParseRetryService")
+            retry_svc = retry_cls()
+        except Exception as e:
+            return {"error": f"重采服务不可用：{e}"}
+
+        confirmation = retry_svc.get_terminal_confirmation(retry_id, batch_key)
+        if confirmation is None:
+            return {"error": f"重采任务 {retry_id} 尚无终态确认，不允许续做"}
+        if confirmation.get("终态") != "已完成":
+            return {
+                "error": f"重采任务 {retry_id} 终态为{confirmation.get('终态')}，不进入续做",
+                "confirmation_id": confirmation.get("确认编号"),
+            }
+
+        credential = confirmation.get("续做凭据")
+        if not credential:
+            return {"error": f"重采任务 {retry_id} 的终态确认缺少续做凭据"}
+
+        # 同一终态确认重复到达时直接返回首次落盘结果，不重复生成解析页。
+        stored_detail = confirmation.get("解析明细")
+        if stored_detail and Path(str(stored_detail.get("output", ""))).exists():
+            return stored_detail
+
+        scope = confirmation.get("续做范围") or {}
+        doc_id = scope.get("文档编号") or ""
+        page_numbers = scope.get("页码范围") or [1, 2, 3]
+        if not doc_id:
+            return {"error": f"重采任务 {retry_id} 的续做范围缺少文档编号"}
+
+        page_records = []
+        for page_num in page_numbers:
+            text = self._simulate_doc_content(f"{doc_id}-p{page_num}", paragraphs=2)
+            page_records.append({
+                "page_id": f"{credential}:{page_num}",
+                "续做凭据": credential,
+                "重采编号": retry_id,
+                "确认编号": confirmation.get("确认编号"),
+                "doc_id": doc_id,
+                "page_num": int(page_num),
+                "paragraph_count": len(text),
+                "text_length": sum(len(line) for line in text),
+                "parser": "PDF",
+                "content_hash": self._compute_checksum("\n".join(text)),
+            })
+
+        output_path = self._data_dir("parsed") / f"{credential}_pages.jsonl"
+        written = 0
+        for record in page_records:
+            # 按页键幂等覆盖：同一续做凭据重复受理只保留一份页明细。
+            written += self._write_jsonl_keyed(output_path, [record], "page_id", record["page_id"])
+
+        recovered = self._mark_source_parse_recovered(confirmation, doc_id, credential)
+
+        detail = {
+            "retry_id": retry_id,
+            "confirmation_id": confirmation.get("确认编号"),
+            "resume_credential": credential,
+            "doc_id": doc_id,
+            "pages": len(page_records),
+            "records_written": written,
+            "output": str(output_path),
+            "recovered_parse_tasks": recovered,
+        }
+        retry_svc.attach_resume_detail(retry_id, detail, batch_key)
+        return detail
+
+    def _mark_source_parse_recovered(
+        self, confirmation: dict[str, Any], doc_id: str, credential: str,
+    ) -> list[str]:
+        """把获准续做范围内仍停在校验失败态的原始解析任务推进到已完成。
+
+        只更新既有解析任务的状态，不新增任务行；同一终态确认重复到达时结果不变。
+        """
+        recovered = []
+        for row in store.rows(self.MODULE):
+            if row.get("文档编号") != doc_id:
+                continue
+            if row.get("status") not in ("解析失败", "待解析", "解析中", "草稿"):
+                continue
+            row["status"] = "已完成"
+            row["pending"] = False
+            row["abnormal"] = False
+            row["终态确认"] = confirmation.get("确认编号")
+            row["续做凭据"] = credential
+            recovered.append(str(row.get("任务编号", row.get("id", ""))))
+        return recovered
 
     def _simulate_pages(self, content: list[str]) -> list[dict[str, Any]]:
         """模拟将文本内容切分为多页文档，每页含段落、表格和图片区域标记。"""

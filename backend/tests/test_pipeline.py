@@ -27,6 +27,7 @@ from app.services.extract_lineage import ExtractLineageService
 from app.services.result_deliver import ResultDeliverService
 from app.services.parse_retry import ParseRetryService
 from app.services.base import DATA_ROOT
+from app.store import store
 
 
 def _uid(prefix="ID"):
@@ -319,6 +320,146 @@ class TestParseRetry:
         svc._write_jsonl(tf, [task])
         result = svc.execute_retry("RETRY-00099")
         assert result.get("status") != "已放弃", f"不应放弃: {result}"
+
+
+class TestParseRetryTerminalConsistency:
+    """重采终态确认：重复到达、续做消费与已放弃任务不被重新打开"""
+
+    @staticmethod
+    def _seed(batch_key, retry_id, scope, status="待重采"):
+        svc = ParseRetryService()
+        task = {
+            "重采编号": retry_id, "失败环节": "格式解析", "原始批次": batch_key,
+            "失败原因": "测试", "重试次数": "0", "重采范围": scope,
+            "恢复游标": "0", "重采结果": "", "status": status,
+        }
+        tf = DATA_ROOT / "retries" / f"{batch_key}_retries.jsonl"
+        svc._write_jsonl(tf, [task])
+        return svc, tf
+
+    def test_duplicate_retry_replays_same_terminal_confirmation(self):
+        batch_key, retry_id = _uid("BT"), _uid("RETRY")
+        doc_id = _uid("DOC")
+        svc, tf = self._seed(batch_key, retry_id, doc_id)
+
+        first = svc.execute_retry(retry_id)
+        again = svc.execute_retry(retry_id)
+        third = svc.execute_retry(retry_id)
+
+        assert first["status"] == again["status"] == third["status"] == "已完成"
+        assert first["confirmation_id"] == again["confirmation_id"] == third["confirmation_id"]
+        assert first["attempts"] == again["attempts"] == third["attempts"] == 1
+        assert first["recovered_offset"] == again["recovered_offset"]
+        assert first["resume_scope"] == again["resume_scope"]
+
+        confirmations = [c for c in svc.list_terminal_confirmations() if c["重采编号"] == retry_id]
+        assert len(confirmations) == 1, "同一重采编号只能有一次终态确认"
+        assert confirmations[0]["终态"] == "已完成"
+
+        persisted = svc._read_jsonl(tf)[0]
+        assert persisted["status"] == "已完成"
+        assert persisted["重试次数"] == "1", "重复到达不能重复累计重试次数"
+
+    def test_completed_retry_cannot_regress_or_be_abandoned(self):
+        batch_key, retry_id = _uid("BT"), _uid("RETRY")
+        svc, _ = self._seed(batch_key, retry_id, _uid("DOC"))
+        svc.execute_retry(retry_id)
+
+        entry = {"id": 9001, "重采编号": retry_id, "原始批次": batch_key,
+                 "失败环节": "格式解析", "重采范围": "DOC-X", "status": "已完成",
+                 "pending": False, "abnormal": False, "重采结果": "成功"}
+        store.rows("parse_retry").append(entry)
+
+        for action in ("启动重采", "标记放弃"):
+            row, _ = svc.run_action(9001, action)
+            assert row["status"] == "已完成", f"{action} 不应改写已完成终态"
+        row, message = svc.run_action(9001, "标记完成")
+        assert row["status"] == "已完成" and "重放" in message
+
+    def test_completed_retry_resume_is_idempotent(self):
+        batch_key, retry_id = _uid("BT"), _uid("RETRY")
+        doc_id = _uid("DOC")
+        svc, _ = self._seed(batch_key, retry_id, doc_id)
+
+        parse_svc = FormatParseService()
+        source, _ = parse_svc.create_entry({
+            "任务编号": _uid("PR"), "文档编号": doc_id, "解析器类型": "PDF",
+        })
+        source["status"] = "解析失败"
+        source["abnormal"] = True
+
+        first = svc.execute_retry(retry_id)
+        credential = first["resume_credential"]
+        pages_file = DATA_ROOT / "parsed" / f"{credential}_pages.jsonl"
+        assert pages_file.exists()
+        pages_after_first = len(svc._read_jsonl(pages_file))
+        parse_rows_after_first = len(store.rows("format_parse"))
+
+        for _ in range(3):
+            svc.execute_retry(retry_id)
+
+        assert len(svc._read_jsonl(pages_file)) == pages_after_first, "重复受理不能追加解析页"
+        assert len(store.rows("format_parse")) == parse_rows_after_first, "重复受理不能新建解析任务"
+        assert source["status"] == "已完成"
+        confirmation = svc.get_terminal_confirmation(retry_id, batch_key)
+        assert confirmation["解析明细"]["resume_credential"] == credential
+        assert confirmation["解析明细"]["pages"] == pages_after_first
+
+    def test_abandoned_retry_is_not_reopened(self):
+        batch_key, retry_id = _uid("BT"), _uid("RETRY")
+        doc_id = _uid("DOC")
+        svc, _ = self._seed(batch_key, retry_id, doc_id, status="已放弃")
+        # 让历史放弃记录带上随任务落地的数据文件，模拟原先已经放弃的任务
+        svc._write_checkpoint(f"retry_{retry_id}", {"retry_id": retry_id, "attempts": 4, "offset": 0})
+
+        first = svc.execute_retry(retry_id)
+        second = svc.execute_retry(retry_id)
+
+        assert first["status"] == "已放弃"
+        assert second["status"] == "已放弃"
+        assert second["confirmation_id"] == first["confirmation_id"]
+        assert not (DATA_ROOT / "parsed" / f"RESUME-{retry_id}_pages.jsonl").exists()
+
+        resume = FormatParseService().resume_from_retry(retry_id, batch_key)
+        assert "error" in resume, "已放弃终态不能进入续做"
+        assert svc.get_terminal_confirmation(retry_id, batch_key)["终态"] == "已放弃"
+
+    def test_exhausted_retry_abandons_once(self):
+        batch_key, retry_id = _uid("BT"), _uid("RETRY")
+        svc, _ = self._seed(batch_key, retry_id, _uid("DOC"))
+        svc._write_checkpoint(f"retry_{retry_id}", {"retry_id": retry_id, "attempts": 3, "offset": 0})
+
+        first = svc.execute_retry(retry_id)
+        repeated = svc.execute_retry(retry_id)
+
+        assert first["status"] == "已放弃"
+        assert repeated["status"] == "已放弃"
+        assert repeated["confirmation_id"] == first["confirmation_id"]
+        assert repeated["reason"] == first["reason"]
+
+    def test_retry_ids_do_not_collide_across_batches(self):
+        svc = ParseRetryService()
+        before = {
+            task["重采编号"]
+            for retry_file in (DATA_ROOT / "retries").glob("*.jsonl")
+            for task in svc._read_jsonl(retry_file)
+        }
+        first = svc.create_retry_from_failures(_uid("BT"))
+        second = svc.create_retry_from_failures(_uid("BT2"))
+        created_first = {
+            task["重采编号"]
+            for retry_file in (DATA_ROOT / "retries").glob("*.jsonl")
+            for task in svc._read_jsonl(retry_file)
+            if task.get("原始批次") == first.get("batch_key")
+        }
+        created_second = {
+            task["重采编号"]
+            for retry_file in (DATA_ROOT / "retries").glob("*.jsonl")
+            for task in svc._read_jsonl(retry_file)
+            if task.get("原始批次") == second.get("batch_key")
+        }
+        assert not (created_first & created_second) or not (created_first | created_second)
+        assert not ((created_first | created_second) & before), "新重采编号不能复用已存在的编号"
 
 
 class TestDataArtifactIntegrity:
